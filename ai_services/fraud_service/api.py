@@ -1,13 +1,34 @@
 import json
+import os
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from model_service import get_model_service
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
+
+BASE_DIR = Path(__file__).resolve().parent
+if load_dotenv is not None:
+    load_dotenv(BASE_DIR / ".env")
+
+GEMINI_MODEL = "gemini-2.5-flash"
 
 
 # ============================================================
@@ -22,6 +43,24 @@ app = FastAPI(
     ),
     version="3.0.0",
 )
+
+
+# ============================================================
+# CORS
+# ============================================================
+# React/Vite frontend runs on port 5173 while FastAPI runs on
+# port 8001. This allows the browser to call the API.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 model_service = get_model_service()
 
@@ -41,6 +80,174 @@ NODE_GATEWAY_URL = "http://localhost:5000/api/fraud-evaluation"
 BLOCKCHAIN_MODULE_URL = (
     "http://localhost:5000/api/blockchain/process-transaction"
 )
+
+
+# ============================================================
+# GEMINI EXPLANATION
+# ============================================================
+
+def _simple_feature_name(feature):
+    mapping = {
+        "sent tnx": "transactions sent",
+        "received tnx": "transactions received",
+        "total ether sent": "ETH sent",
+        "total ether received": "ETH received",
+        "total ether balance": "ETH balance",
+        "number of created contracts": "contracts created",
+        "unique received from addresses": "different sending addresses",
+        "unique sent to addresses": "different receiving addresses",
+        "avg min between sent tnx": "average time between sent transactions",
+        "avg min between received tnx": "average time between received transactions",
+        "time diff between first and last (mins)": "wallet activity period",
+        "min value received": "smallest received amount",
+        "max value received": "largest received amount",
+        "avg val received": "average received amount",
+        "min val sent": "smallest sent amount",
+        "max val sent": "largest sent amount",
+        "avg val sent": "average sent amount",
+    }
+    key = str(feature or "").strip().lower()
+    return mapping.get(key, str(feature or "transaction behaviour").strip())
+
+
+def _fallback_genai(assessment):
+    probability = float(
+        assessment.get("base_xgboost_probability",
+                       assessment.get("on_chain_risk", 0.0)) or 0.0
+    )
+    prediction = bool(assessment.get("model_prediction", 0))
+    title = (
+        "Why is this transaction suspicious?"
+        if prediction
+        else "Why is this transaction considered safe?"
+    )
+
+    rows = []
+    for row in assessment.get("local_shap", []) or []:
+        if isinstance(row, dict):
+            try:
+                value = float(row.get("shap_value", 0) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if (prediction and value > 0) or (not prediction and value < 0):
+                rows.append((abs(value), value, _simple_feature_name(row.get("feature"))))
+
+    rows.sort(reverse=True)
+    points = []
+    for _, value, name in rows[:3]:
+        if prediction:
+            points.append(f"The wallet's {name} increased the suspiciousness of the transaction.")
+        else:
+            points.append(f"The wallet's {name} helped keep the transaction risk lower.")
+
+    defaults = (
+        [
+            "The wallet shows transaction behaviour that is less typical of legitimate activity.",
+            "Several transaction signals together increased the fraud risk.",
+            f"The fraud detector estimated a {probability * 100:.2f}% fraud probability.",
+        ]
+        if prediction else
+        [
+            "The wallet shows transaction behaviour closer to legitimate activity.",
+            "The fraud detector did not find strong signals pointing toward fraud.",
+            f"The fraud detector estimated a {probability * 100:.2f}% fraud probability.",
+        ]
+    )
+    for point in defaults:
+        if len(points) >= 3:
+            break
+        points.append(point)
+
+    return {"title": title, "points": points[:3], "source": "Fallback explanation"}
+
+
+def generate_genai_explanation(assessment):
+    fallback = _fallback_genai(assessment)
+
+    if genai is None or types is None:
+        return fallback
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("GEMINI ERROR: GEMINI_API_KEY is not set.")
+        return fallback
+
+    probability = float(
+        assessment.get("base_xgboost_probability",
+                       assessment.get("on_chain_risk", 0.0)) or 0.0
+    )
+    prediction = bool(assessment.get("model_prediction", 0))
+    title = fallback["title"]
+
+    signals = []
+    for row in assessment.get("local_shap", []) or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            value = float(row.get("shap_value", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if (prediction and value <= 0) or (not prediction and value >= 0):
+            continue
+        signals.append({
+            "behaviour": _simple_feature_name(row.get("feature")),
+            "direction": "higher fraud risk" if value > 0 else "lower fraud risk",
+            "strength": round(abs(value), 6),
+        })
+
+    signals.sort(key=lambda x: x["strength"], reverse=True)
+    signals = signals[:4]
+
+    decision = "suspicious" if prediction else "likely legitimate"
+    prompt = f"""
+You are the explanation component of a DeFi fraud detection dashboard.
+
+The fraud detector has already classified this transaction as: {decision}.
+Fraud probability: {probability * 100:.2f}%.
+
+Strongest supplied signals:
+{json.dumps(signals, indent=2)}
+
+Write exactly 3 short points explaining the result to an ordinary DeFi user.
+Rules:
+- Support the existing classification; do not change it.
+- Use only the supplied signals.
+- Do not invent facts.
+- Do not mention SHAP, XGBoost, machine learning, algorithms, weights, or model internals.
+- Do not say the transaction is definitely fraudulent.
+- One sentence per point.
+- Return only the three points, one per line.
+"""
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=180,
+            ),
+        )
+        text = (getattr(response, "text", None) or "").strip()
+        points = []
+        for line in text.splitlines():
+            line = re.sub(r"^[-•*]\s*", "", line.strip())
+            line = re.sub(r"^\d+[.)]\s*", "", line).strip()
+            if len(line) >= 15:
+                points.append(line)
+
+        if len(points) < 3:
+            raise RuntimeError(f"Gemini returned only {len(points)} usable points.")
+
+        return {"title": title, "points": points[:3], "source": "Gemini GenAI"}
+
+    except Exception as exc:
+        print("========== GEMINI ACTUAL ERROR ==========")
+        print(type(exc).__name__)
+        print(repr(exc))
+        print("==========================================")
+        return fallback
 
 
 # ============================================================
@@ -193,6 +400,20 @@ def extract_borrower_address(
         or request.borrower_address
         or request.wallet_address
     )
+
+
+# ============================================================
+# ROOT / QUICK CHECK
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "service": "DeFiLens Fraud Detection API",
+        "status": "running",
+        "assessment_endpoint": "/api/v1/assess-risk",
+        "health_endpoint": "/api/v1/health"
+    }
 
 
 # ============================================================
@@ -430,6 +651,19 @@ def assess_risk(
     )
 
     # ========================================================
+    # STEP 3.5
+    # Expose explainability results to the frontend
+    # ========================================================
+
+    # model_service already computes these when the request flags are True.
+    assessment["shap"] = assessment.get("local_shap", [])
+    assessment["boosting"] = assessment.get("boosting_progression", [])
+
+    # Gemini explains the model output; it never changes the prediction.
+    assessment["genai_explanation"] = generate_genai_explanation(assessment)
+    assessment["genai_points"] = assessment["genai_explanation"].get("points", [])
+
+# ========================================================
     # STEP 4
     # Extract Fraud Decision
     # ========================================================
