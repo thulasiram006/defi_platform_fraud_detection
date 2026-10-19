@@ -1,0 +1,22 @@
+[
+    "Unnamed: 0",
+    "Index",
+    "total ether received",
+    "Avg min between received tnx",
+    "Avg min between sent tnx",
+    "Sent tnx",
+    "Time Diff between first and last (Mins)",
+    "Number of Created Contracts",
+    "Unique Received From Addresses",
+    "Unique Sent To Addresses",
+    "min value received",
+    "max value received ",
+    "avg val received",
+    "min val sent",
+    "Received Tnx",
+    "max val sent",
+    "avg val sent",
+    "max val sent to contract",
+    "min value sent to contract",
+    "avg value sent to contract"
+]

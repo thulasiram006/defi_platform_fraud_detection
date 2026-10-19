@@ -15,7 +15,7 @@ from xgboost import XGBClassifier, DMatrix
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "saved_model"
 
-DATASET_PATH = BASE_DIR / "transaction_dataset.csv"
+DATASET_PATH = BASE_DIR / "data" / "transaction_dataset.csv"
 
 MODEL_PATH = MODEL_DIR / "defilens_fraud_xgboost.json"
 IMPUTER_PATH = MODEL_DIR / "imputer.joblib"
@@ -392,16 +392,12 @@ class DeFiLensModel:
     # PREDICTION
     # ========================================================
 
-    def predict(self, transaction):
-        X = self.prepare_features(transaction)
-
+    def _predict_prepared_features(self, X):
+        """Predict from already-prepared features to avoid duplicate preprocessing."""
         probability = float(
             self.model.predict_proba(X)[0][1]
         )
-
-        prediction = int(
-            probability >= self.threshold
-        )
+        prediction = int(probability >= self.threshold)
 
         return {
             "fraud_probability": probability,
@@ -410,12 +406,26 @@ class DeFiLensModel:
             "features_used": len(self.selected_features)
         }
 
+    def predict(self, transaction):
+        """Public prediction method for raw transaction dictionaries."""
+        X = self.prepare_features(transaction)
+        return self._predict_prepared_features(X)
+
     # ========================================================
     # BOOSTING PROGRESSION
     # ========================================================
 
-    def get_boosting_progression(self, transaction):
-        X = self.prepare_features(transaction)
+    def get_boosting_progression(
+        self,
+        transaction=None,
+        prepared_features=None
+    ):
+        """Return cumulative boosting probabilities using reusable features."""
+        X = (
+            prepared_features
+            if prepared_features is not None
+            else self.prepare_features(transaction)
+        )
 
         booster = self.model.get_booster()
         rounds = booster.num_boosted_rounds()
@@ -458,13 +468,23 @@ class DeFiLensModel:
     # LOCAL SHAP
     # ========================================================
 
-    def get_local_shap(self, transaction, limit=20):
+    def get_local_shap(
+        self,
+        transaction=None,
+        limit=20,
+        prepared_features=None
+    ):
+        """Return local SHAP values, reusing prepared features when supplied."""
         try:
             import shap
         except ImportError:
             return []
 
-        X = self.prepare_features(transaction)
+        X = (
+            prepared_features
+            if prepared_features is not None
+            else self.prepare_features(transaction)
+        )
 
         try:
             explainer = shap.TreeExplainer(self.model)
@@ -654,9 +674,16 @@ class DeFiLensModel:
         transaction = lookup["transaction"]
 
         # -----------------------------
+        # PREPARE FEATURES ONCE
+        # -----------------------------
+        # Prediction, boosting progression, and SHAP all use the same
+        # imputed/selected feature matrix for this wallet assessment.
+        X = self.prepare_features(transaction)
+
+        # -----------------------------
         # ON-CHAIN MODEL
         # -----------------------------
-        prediction = self.predict(transaction)
+        prediction = self._predict_prepared_features(X)
         base_probability = prediction["fraud_probability"]
         on_chain_risk = self._clamp(base_probability)
 
@@ -764,12 +791,16 @@ class DeFiLensModel:
 
         if include_boosting:
             result["boosting_progression"] = (
-                self.get_boosting_progression(transaction)
+                self.get_boosting_progression(
+                    prepared_features=X
+                )
             )
 
         if include_shap:
             result["local_shap"] = (
-                self.get_local_shap(transaction)
+                self.get_local_shap(
+                    prepared_features=X
+                )
             )
 
         return result

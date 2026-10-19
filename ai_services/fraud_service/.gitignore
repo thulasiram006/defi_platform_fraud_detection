@@ -1,1 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
 .env
+latest_module1_payload.json
+latest_module2_payload.json
